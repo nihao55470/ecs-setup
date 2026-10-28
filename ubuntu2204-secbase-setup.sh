@@ -48,8 +48,50 @@ echo "node $(node -v) / npm $(npm -v)"
 npm install -g @deepseek-ai/dsh
 mkdir -p /root/dsh-work
 echo "dsh 已安装：$(command -v dsh)"
-# 首次使用：cd /root/dsh-work && tmux new -s dsh && dsh web
-# Web 界面地址与 token 记录在 /root/dsh-work/url.log；DeepSeek 账号凭证存于 /root/.dsh/.credentials.yaml
+
+# ---------- 3c. dsh 进程资源笼子（防内存/IO 搞崩整机） ----------
+log "3c/8 配置 dsh 资源限制启动器"
+cat > /usr/local/bin/dsh-web <<'LAUNCHER'
+#!/usr/bin/env bash
+# 在 cgroup 限制下启动 DSH Web：dsh 及其子进程内存合计超 6G、CPU 超 1.5 核
+# 时由系统强制终止 dsh 本身，整机（8G 内存）不受影响。
+# 用法：tmux new -s dsh 然后执行 dsh-web
+exec systemd-run --scope -p MemoryMax=6G -p CPUQuota=150% --unit=dsh-guard dsh web
+LAUNCHER
+chmod +x /usr/local/bin/dsh-web
+
+# ---------- 3d. HuggingFace 镜像（模型下载走国内，防超时反复重试拖垮磁盘） ----------
+grep -q '^HF_ENDPOINT=' /etc/environment 2>/dev/null || echo 'HF_ENDPOINT="https://hf-mirror.com"' >> /etc/environment
+
+# 启动方式：tmux new -s dsh && dsh-web（不要直接跑 dsh web，那样没有资源笼子）
+# token 记录在 /root/dsh-work/url.log；DeepSeek 账号凭证存于 /root/.dsh/.credentials.yaml
+
+# ---------- 3e. DSH 安全运行提示词（每次开任务时整段粘贴给 DSH） ----------
+cat > /root/dsh-guard-prompt.md <<'PROMPT'
+# DeepSeek Harness 安全运行约束提示词
+# 用法：每次在 DSH 里开新任务/新会话时，把下面整段粘贴到任务提示的最前面。
+
+【运行环境硬约束，任务开始前必须先读，每条都不可违反】
+本机：2核 CPU / 8G 内存 / 40G 磁盘（已用约 8G）。这是长期运行的服务器，
+/root 下还有 sshd、fail2ban、docker 等系统服务，你的任何失误都可能搞崩整机。
+
+1. 内存红线：每个大步骤前跑 free -h。available < 2G 时禁止启动任何新任务；
+   训练/推理时限制 batch size，DataLoader 的 num_workers ≤ 2，torch.set_num_threads(2)。
+2. 磁盘红线：任务开始和结束时跑 df -h。任何超过 500MB 的下载，必须先停下向我报备，
+   我同意才能下。所有数据和模型只允许放 /data 或 /root/dsh-work，磁盘用量超过 25G 立即停止并汇报。
+3. 下载一律走镜像：pip 用已配置的阿里云源；HuggingFace 必须设置
+   HF_ENDPOINT=https://hf-mirror.com；禁止从其他来源下载大文件。
+4. 编译/安装限制并行度：make -j2。禁止执行：apt upgrade、apt autoremove、
+   systemctl restart/stop、reboot、任何写 /etc 的操作。
+5. 禁区：不得修改 /etc/ssh、/etc/fstab、fail2ban、docker 全局配置、systemd 服务；
+   rm 只允许作用于 /root/dsh-work 和 /data 内你本次创建的文件；任何服务不得监听 0.0.0.0。
+6. 单任务原则：同一时间只允许一个下载/训练/编译任务在跑，禁止并行。
+7. 超时纪律：单条命令 10 分钟无输出视为卡死，终止并汇报；任务总时长超 1 小时先汇报进度。
+8. 收尾：任务结束后执行 pip cache purge，并汇报三件事——磁盘/内存现状、产出文件路径
+   （含大小）、哪些中间产物可以安全删除。
+
+违反任何一条，立即停止当前操作并向我汇报，不要尝试自行"修复"系统。
+PROMPT
 
 # ---------- 4. pip 镜像加速 ----------
 log "4/8 配置 pip 阿里云镜像"
@@ -84,6 +126,9 @@ echo -n "compose     : "; docker compose version | head -1
 echo -n "nmap        : "; nmap --version | head -1
 echo -n "node        : "; node -v
 echo -n "dsh         : "; dsh --version
+echo -n "dsh 启动器  : "; [ -x /usr/local/bin/dsh-web ] && echo "dsh-web（含 6G 内存笼 + 1.5 核限额）" || echo 缺失
+echo -n "HF 镜像     : "; grep -o '^HF_ENDPOINT=.*' /etc/environment 2>/dev/null || echo 未配置
+echo -n "安全提示词  : "; [ -f /root/dsh-guard-prompt.md ] && echo "/root/dsh-guard-prompt.md（开任务时粘贴给 DSH）" || echo 缺失
 echo -n "SSH 密码登录: "; sshd -T | grep -i '^passwordauthentication'
 echo -n "swap        : "; free -h | awk '/Swap/{print $2}'
 echo -n "磁盘        : "; df -h / | tail -1
